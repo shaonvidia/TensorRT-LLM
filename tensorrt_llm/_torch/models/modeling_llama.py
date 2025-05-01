@@ -310,21 +310,11 @@ class Llama4MoE(nn.Module):
     ) -> torch.Tensor:
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
-        do_multi_stream = torch.cuda.is_current_stream_capturing()
-        if do_multi_stream:
-            self.moe_event[0].record()
-        shared_output = self.shared_expert(hidden_states)
-        if do_multi_stream:
-            with torch.cuda.stream(self.aux_stream):
-                self.moe_event[0].wait()
-                routed_output = self.compute_routed_output(
-                    hidden_states, all_rank_num_tokens, min_latency_mode)
-                self.moe_event[1].record()
-            self.moe_event[1].wait()
-        else:
-            routed_output = self.compute_routed_output(hidden_states,
-                                                       all_rank_num_tokens,
-                                                       min_latency_mode)
+        fn0 = lambda: self.shared_expert(hidden_states)
+        fn1 = lambda: self.compute_routed_output(
+            hidden_states, all_rank_num_tokens, min_latency_mode)
+        shared_output, routed_output = maybe_execute_in_parallel(
+            fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
         if min_latency_mode:
             return [shared_output, *routed_output]
 
@@ -469,6 +459,10 @@ class Llama4DecoderLayer(DecoderLayer):
             min_latency_mode=min_latency_mode,
         )
         if spec_metadata is not None:
+            # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
+            # PyExecutor will extract these from the model engine's spec metadata.
+            # They will be passed to the draft model engine on the first draft iteration.
+            # TODO: can we support multiple model outputs instead?
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
 
@@ -567,6 +561,10 @@ class LlamaDecoderLayer(DecoderLayer):
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states, **kwargs)
         if spec_metadata is not None:
+            # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
+            # PyExecutor will extract these from the model engine's spec metadata.
+            # They will be passed to the draft model engine on the first draft iteration.
+            # TODO: can we support multiple model outputs instead?
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
         return hidden_states, residual
@@ -644,6 +642,7 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -661,6 +660,15 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+
+        assert isinstance(spec_metadata, Eagle3SpecMetadata)
+        # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
+        # PyExecutor will extract these from the draft model engine's spec metadata.
+        # They will be passed to the draft model engine on the next iteration.
+        # TODO: can we support multiple model outputs instead?
+        spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states,
+                                                  residual)
+
         return hidden_states, residual
 
 
@@ -838,7 +846,7 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
 
 @register_auto_model("Llama4ForCausalLM")
-class Llama4ForCausalLM(DecoderModelForCausalLM[LlamaModel, Llama4Config]):
+class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
 
     def __init__(
         self,
@@ -914,13 +922,21 @@ class Llama4InputProcessor(InputProcessor):
             do_rescale = (img_type == Image)
             assert all(isinstance(img, img_type) for img in mm_data["image"])
 
+        truncate_kwargs = {}
+        if sampling_params.truncate_prompt_tokens is not None:
+            truncate_kwargs[
+                "max_length"] = sampling_params.truncate_prompt_tokens
+            truncate_kwargs["truncation"] = True
+
         # preprocess images and insert image tokens
-        processed = self.processor(text=text_prompt,
-                                   images=images,
-                                   return_tensors="pt",
-                                   device="cuda",
-                                   do_rescale=do_rescale,
-                                   add_special_tokens=False)
+        processed = self.processor(
+            text=text_prompt,
+            images=images,
+            return_tensors="pt",
+            device="cuda",
+            do_rescale=do_rescale,
+            add_special_tokens=sampling_params.add_special_tokens,
+            **truncate_kwargs)
         if images:
             token_ids, pixel_values = processed["input_ids"].squeeze(
             ), processed["pixel_values"]
@@ -929,9 +945,7 @@ class Llama4InputProcessor(InputProcessor):
             mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
             # for fuse_input_embeds
             token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
-            return token_ids.tolist(), {
-                "prompt_tuning_config": [mm_embeds, None, None]
-            }
+            return token_ids.tolist(), {"mm_embedding": mm_embeds}
         else:
             return processed["input_ids"].squeeze().tolist(), {}
 
@@ -1049,12 +1063,10 @@ class Eagle3LlamaDraftModel(DecoderModel):
         hidden_states, residual = self.midlayer(position_ids=position_ids,
                                                 embeds=inputs_embeds,
                                                 hidden_states=hidden_states,
-                                                attn_metadata=attn_metadata)
+                                                attn_metadata=attn_metadata,
+                                                spec_metadata=spec_metadata)
 
-        hidden_states, hidden_states_to_save = self.norm(
-            hidden_states, residual)
-        assert isinstance(spec_metadata, Eagle3SpecMetadata)
-        spec_metadata.maybe_capture_hidden_states(1, hidden_states_to_save)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
